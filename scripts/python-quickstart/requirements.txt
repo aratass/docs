@@ -1,0 +1,25 @@
+# Pinned dependencies for guides/quickstarts/python.mdx, checked by run_quickstart.py.
+# Direct: stellar-sdk, cryptography, httpx (Step 1 of the guide). The rest is their
+# dependency tree, frozen from a clean Python 3.11 environment.
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.2
+cryptography==50.0.2
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+mnemonic==0.21
+pycparser==3.11
+pydantic==2.14.1
+pydantic_core==2.50.1
+PyNaCl==1.6.2
+requests==2.34.2
+requests-sse==0.5.3
+stellar-sdk==16.1.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.8.0
+xdrlib3==0.1.1

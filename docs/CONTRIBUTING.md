@@ -44,6 +44,29 @@ request must hit a route documented on the page, and each fixture is compiled wi
 When an example calls an endpoint, add one fixture per request it makes. `no-check`
 is not allowed on that page.
 
+### Python quickstart
+
+`guides/quickstarts/python.mdx` runs end to end in CI, offline, as part of
+`check:snippets-extended`:
+
+```bash
+npm run check:python-quickstart
+```
+
+`scripts/python-quickstart/run_quickstart.py` builds `wraith_crypto.py` from the
+fence that starts with `# wraith_crypto.py` (plus any `# Add to wraith_crypto.py`
+fences), then runs every other Python fence in page order in one session. The
+Soroban RPC, Horizon, and Soroban transaction calls go to local fakes that serve
+recorded announcer events and verify each transaction's signatures. Results are
+compared with `scripts/python-quickstart/vectors.json`, which
+`npm run generate:python-quickstart-vectors` computes from the pinned SDK.
+
+Dependencies are pinned in `scripts/python-quickstart/requirements.txt`. The
+`--bootstrap` flag creates a virtualenv with those pins under
+`node_modules/.cache`. Every Python fence in the guide must run. A fence that
+cannot run needs both words after the language, `python Pseudocode no-check`, so
+readers see it is pseudocode.
+
 ## Navigation coverage
 
 Every `.mdx` page in the shipped taxonomy (root pages plus `architecture/`,
