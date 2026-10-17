@@ -27,6 +27,23 @@ Use `no-check` only for intentionally illustrative pseudocode:
 
 Prefer making snippets compile over opting them out.
 
+### API endpoint examples
+
+`api-reference/endpoints.mdx` has a stricter gate, which `check:snippets` also runs:
+
+```bash
+npm run check:api-examples
+```
+
+The checker (`scripts/check-api-examples.ts`) compiles the page's TypeScript fences
+together, in page order, as one `strict` module, then runs them offline against the
+typed response fixtures in `scripts/fixtures/api-endpoint-responses.json`. Each
+request must hit a route documented on the page, and each fixture is compiled with
+`satisfies` against the response type it names.
+
+When an example calls an endpoint, add one fixture per request it makes. `no-check`
+is not allowed on that page.
+
 ## Navigation coverage
 
 Every `.mdx` page in the shipped taxonomy (root pages plus `architecture/`,
