@@ -1,14 +1,14 @@
 ---
 title: "Python Quickstart"
 description: "Derive stealth keys, fetch announcements, scan for owned payments, and send a stealth transfer — all from Python 3.11+ using stellar-sdk and a small crypto utility."
-keywords: "Python, stellar-sdk, stealth payment, Soroban RPC, ed25519, X25519, futurenet, scan key"
+keywords: "Python, stellar-sdk, stealth payment, Soroban RPC, ed25519, X25519, testnet, scan key"
 ---
 
 <Note>
-  This guide targets the Wraith contracts on the Stellar **futurenet**. The
-  derivation crypto and RPC calls are identical on testnet and mainnet — only the
-  `soroban_rpc_url`, `network_passphrase`, and `announcer_contract_id` differ.
-  See [Stellar Networks](/reference/stellar-networks) for the full address table.
+  This guide targets the Wraith contracts on Stellar **testnet**. The derivation
+  crypto and RPC calls are identical on mainnet — only the RPC URLs,
+  `NETWORK_PASS`, and `ANNOUNCER_CONTRACT_ID` differ. See
+  [Stellar Networks](/reference/stellar-networks) for the full address table.
 </Note>
 
 By the end of this guide you will have:
@@ -17,20 +17,25 @@ By the end of this guide you will have:
 - Fetched announcement events from the Soroban RPC without the TypeScript SDK
 - Scanned those announcements to find payments addressed to you
 - Sent a stealth payment and published an on-chain announcement
+- Spent from a stealth address with its derived private scalar
 
-**Prerequisites:** Python 3.11+, `pip`, and a Stellar keypair you can fund on futurenet.
+**Prerequisites:** Python 3.11+, `pip`, and a Stellar testnet keypair funded with Friendbot.
+
+The steps build on each other: run them in order in one Python session, or paste
+them into one script.
 
 ---
 
 ## Step 1 — Install dependencies
 
-```bash no-check
-pip install stellar-sdk==11.* cryptography
+```bash
+pip install stellar-sdk==16.1.0 cryptography==50.0.2 httpx==0.28.1
 ```
 
 `stellar-sdk` handles Soroban RPC calls, XDR encoding, transaction building, and
-`StrKey` address encoding. `cryptography` provides X25519 Diffie-Hellman needed for
-the shared-secret step.
+`StrKey` address encoding. `cryptography` provides the ed25519 and X25519
+primitives the crypto utility builds on, and `httpx` makes the JSON-RPC calls in
+Step 4. These are the versions the docs CI runs this guide against.
 
 No TypeScript toolchain is required.
 
@@ -42,7 +47,7 @@ This utility file implements the three primitives the rest of the guide relies o
 **key derivation**, **stealth address generation**, and **announcement scanning**. It
 is intentionally self-contained — copy it into your project and import from it.
 
-```python no-check
+```python
 # wraith_crypto.py
 """
 Wraith Protocol — Stellar stealth-address crypto, pure Python.
@@ -50,28 +55,25 @@ Wraith Protocol — Stellar stealth-address crypto, pure Python.
 Implements the same derivation as @wraith-protocol/sdk/chains/stellar:
   - SHA-256 domain separation for spending/viewing seeds
   - X25519 ECDH via Edwards-to-Montgomery conversion
-  - View-tag prefilter (1 byte, ~255/256 skip rate)
-  - ed25519 scalar addition for stealth pub-key derivation
+  - v2 view tag over the ephemeral and viewing public keys (1 byte, ~255/256 skip rate)
+  - ed25519 point arithmetic for stealth public keys
 
-Requires: cryptography>=41, stellar-sdk>=11
+The curve arithmetic uses Python integers and is not constant-time. It suits
+scanning and tooling; keep production signing keys on hardened code.
+
+Requires: stellar-sdk and cryptography (pinned versions in Step 1)
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
-import struct
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    PublicFormat,
-    PrivateFormat,
-    NoEncryption,
-)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from stellar_sdk import Keypair
 
 # ---------------------------------------------------------------------------
@@ -86,7 +88,7 @@ STEALTH_SIGNING_MESSAGE = (
 )
 
 META_ADDRESS_PREFIX = "st:xlm:"
-SCHEME_ID = 1
+SCHEME_ID = 2  # the stealth-announcer v2 contract only accepts scheme 2
 
 # ed25519 group order L
 L = 2**252 + 27742317777372353535851937790883648493
@@ -103,8 +105,11 @@ def _sha256(*parts: bytes) -> bytes:
     return h.digest()
 
 
-def _sha512(data: bytes) -> bytes:
-    return hashlib.sha512(data).digest()
+def _sha512(*parts: bytes) -> bytes:
+    h = hashlib.sha512()
+    for part in parts:
+        h.update(part)
+    return h.digest()
 
 
 def _clamp_scalar(scalar_bytes: bytearray) -> bytearray:
@@ -124,8 +129,7 @@ def _seed_to_scalar(seed: bytes) -> int:
     3. Clamp a
     4. Interpret as little-endian bigint
     """
-    h = _sha512(seed)
-    a = bytearray(h[:32])
+    a = bytearray(_sha512(seed)[:32])
     _clamp_scalar(a)
     return int.from_bytes(a, "little")
 
@@ -137,33 +141,81 @@ def _ed25519_pub_from_seed(seed: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Edwards-to-Montgomery conversion (RFC 7748)
+# ed25519 point arithmetic (affine coordinates on -x^2 + y^2 = 1 + d*x^2*y^2)
 # ---------------------------------------------------------------------------
 
-# Ed25519 curve parameters
 _P = 2**255 - 19
 _D = -121665 * pow(121666, _P - 2, _P) % _P
+_SQRT_M1 = pow(2, (_P - 1) // 4, _P)
+
+Point = tuple[int, int]
+_IDENTITY: Point = (0, 1)
 
 
-def _decompress_ed25519(point_bytes: bytes) -> tuple[int, int]:
-    """Decompress a 32-byte compressed ed25519 point to (x, y)."""
+def _decompress_ed25519(point_bytes: bytes) -> Point:
+    """Decompress a 32-byte ed25519 point to (x, y), rejecting invalid encodings."""
+    if len(point_bytes) != 32:
+        raise ValueError("ed25519 points are 32 bytes")
     y_int = int.from_bytes(point_bytes, "little")
-    sign = (y_int >> 255) & 1
+    sign = y_int >> 255
     y = y_int & ((1 << 255) - 1)
+    if y >= _P:
+        raise ValueError("not a valid ed25519 point")
 
-    # Recover x from the curve equation: -x^2 + y^2 = 1 + d*x^2*y^2
-    y2 = (y * y) % _P
-    x2 = (y2 - 1) * pow(1 + _D * y2, _P - 2, _P) % _P
+    # Recover x from the curve equation: x^2 = (y^2 - 1) / (d*y^2 + 1)
+    y2 = y * y % _P
+    x2 = (y2 - 1) * pow(_D * y2 + 1, _P - 2, _P) % _P
     x = pow(x2, (_P + 3) // 8, _P)
-
     if (x * x - x2) % _P != 0:
-        _I = pow(2, (_P - 1) // 4, _P)
-        x = x * _I % _P
-
+        x = x * _SQRT_M1 % _P
+    if (x * x - x2) % _P != 0 or (x == 0 and sign == 1):
+        raise ValueError("not a valid ed25519 point")
     if x % 2 != sign:
         x = _P - x
-
     return x, y
+
+
+def _compress_ed25519(point: Point) -> bytes:
+    """Encode (x, y) as 32 bytes: y little-endian, sign of x in the top bit."""
+    x, y = point
+    encoded = bytearray(y.to_bytes(32, "little"))
+    if x & 1:
+        encoded[31] |= 0x80
+    return bytes(encoded)
+
+
+def _point_add(p1: Point, p2: Point) -> Point:
+    """
+    Edwards point addition (complete on ed25519, so it also doubles):
+      x3 = (x1*y2 + y1*x2) / (1 + d*x1*x2*y1*y2)
+      y3 = (y1*y2 + x1*x2) / (1 - d*x1*x2*y1*y2)
+    """
+    x1, y1 = p1
+    x2, y2 = p2
+    t = _D * x1 * x2 * y1 * y2 % _P
+    x3 = (x1 * y2 + y1 * x2) * pow(1 + t, _P - 2, _P) % _P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, _P - 2, _P) % _P
+    return x3, y3
+
+
+def _scalar_mult(scalar: int, point: Point) -> Point:
+    """scalar * point by double-and-add."""
+    result, addend = _IDENTITY, point
+    while scalar:
+        if scalar & 1:
+            result = _point_add(result, addend)
+        addend = _point_add(addend, addend)
+        scalar >>= 1
+    return result
+
+
+# Base point G: y = 4/5, x even
+_BASE = _decompress_ed25519((4 * pow(5, _P - 2, _P) % _P).to_bytes(32, "little"))
+
+
+def _scalar_mult_base(scalar: int) -> bytes:
+    """Return scalar * G, compressed."""
+    return _compress_ed25519(_scalar_mult(scalar, _BASE))
 
 
 def _edwards_to_montgomery_pub(ed_pub: bytes) -> bytes:
@@ -180,10 +232,7 @@ def _edwards_to_montgomery_priv(ed_seed: bytes) -> bytes:
     """
     Convert an ed25519 seed to the X25519 scalar (lower 32 bytes of SHA-512, clamped).
     """
-    h = _sha512(ed_seed)
-    a = bytearray(h[:32])
-    _clamp_scalar(a)
-    return bytes(a)
+    return bytes(_clamp_scalar(bytearray(_sha512(ed_seed)[:32])))
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +279,8 @@ def derive_stealth_keys(signature: bytes) -> StealthKeys:
     Domain-separated hashing is used (instead of splitting r/s) because
     ed25519 signature components lack the independence of secp256k1 components.
     """
+    if len(signature) != 64:
+        raise ValueError("Expected a 64-byte ed25519 signature")
     spending_key = _sha256(b"wraith:spending:", signature)
     viewing_key  = _sha256(b"wraith:viewing:",  signature)
 
@@ -256,13 +307,14 @@ def _x25519_shared_secret(priv_ed_seed: bytes, pub_ed: bytes) -> bytes:
     return x_priv.exchange(x_pub)
 
 
-def _compute_view_tag(shared_secret: bytes) -> int:
+def compute_view_tag(ephemeral_pub_key: bytes, viewing_pub_key: bytes) -> int:
     """
-    Compute the 1-byte view tag (v2 domain).
-    view_tag = SHA-256("wraith:stellar:view-tag:v2:" || shared_secret)[0]
+    Compute the 1-byte v2 view tag (mirrors computeAnnouncementViewTag in the SDK).
+    view_tag = SHA-256("wraith:stellar:view-tag:v2:" || ephemeral_pub || viewing_pub)[0]
+
+    It needs no ECDH, so scanners reject ~255/256 announcements with one hash.
     """
-    digest = _sha256(b"wraith:stellar:view-tag:v2:", shared_secret)
-    return digest[0]
+    return _sha256(b"wraith:stellar:view-tag:v2:", ephemeral_pub_key, viewing_pub_key)[0]
 
 
 def _hash_to_scalar(shared_secret: bytes) -> int:
@@ -274,45 +326,14 @@ def _hash_to_scalar(shared_secret: bytes) -> int:
     return int.from_bytes(digest, "little") % L
 
 
-def _ed25519_point_add(pub_bytes: bytes, scalar: int) -> bytes:
+def _derive_stealth_pub_key(spending_pub_key: bytes, h_scalar: int) -> bytes:
     """
-    Compute P + scalar*G on ed25519 and return the compressed 32-byte result.
-    Uses the cryptography library's internal scalar multiplication via a trick:
-    we derive scalar*G from a raw scalar key, then add to P via field arithmetic.
-
-    This mirrors deriveStealthPubKey in the SDK (scalar.ts point addition).
+    stealth_pub = spending_pub + h_scalar * G
+    (mirrors deriveStealthPubKey in SDK scalar.ts)
     """
-    # scalar * G  →  get the public key for scalar as a raw scalar
-    # We represent scalar as a little-endian 32-byte value and manually construct
-    # the point using the standard ed25519 signing key structure.
-    # Note: we're doing point addition in the ed25519 group.
-
-    # Decompress both points
-    x1, y1 = _decompress_ed25519(pub_bytes)
-
-    # scalar * G: derive public key bytes from scalar
-    scalar_bytes = scalar.to_bytes(32, "little")
-    scalar_ed = Ed25519PrivateKey.from_private_bytes(scalar_bytes)
-    scalar_g_bytes = scalar_ed.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    x2, y2 = _decompress_ed25519(scalar_g_bytes)
-
-    # Edwards point addition formula:
-    # x3 = (x1*y2 + y1*x2) / (1 + d*x1*x2*y1*y2)
-    # y3 = (y1*y2 + x1*x2) / (1 - d*x1*x2*y1*y2)
-    x1y2 = x1 * y2 % _P
-    y1x2 = y1 * x2 % _P
-    x1x2 = x1 * x2 % _P
-    y1y2 = y1 * y2 % _P
-    dx1x2y1y2 = _D * x1x2 * y1y2 % _P
-
-    x3 = (x1y2 + y1x2) * pow(1 + dx1x2y1y2, _P - 2, _P) % _P
-    y3 = (y1y2 + x1x2) * pow(1 - dx1x2y1y2, _P - 2, _P) % _P
-
-    # Compress: encode y with sign bit of x
-    result = bytearray(y3.to_bytes(32, "little"))
-    if x3 & 1:
-        result[31] |= 0x80
-    return bytes(result)
+    spending_point = _decompress_ed25519(spending_pub_key)
+    h_point = _scalar_mult(h_scalar, _BASE)
+    return _compress_ed25519(_point_add(spending_point, h_point))
 
 
 def _pub_key_to_stellar_address(pub_key: bytes) -> str:
@@ -334,28 +355,24 @@ def generate_stealth_address(
     Algorithm (mirrors generateStealthAddress in SDK stealth.ts):
       1. Ephemeral ed25519 key pair
       2. X25519 ECDH shared secret with recipient's viewing key
-      3. view_tag = SHA-256("wraith:stellar:view-tag:v2:" || shared)[0]
+      3. view_tag = SHA-256("wraith:stellar:view-tag:v2:" || ephemeral_pub || viewing_pub)[0]
       4. h_scalar = SHA-256("wraith:scalar:" || shared) mod L
       5. stealth_point = spending_pub + h_scalar * G   (ed25519 point addition)
       6. Encode as Stellar G... via StrKey
     """
-    import os
     if ephemeral_seed is None:
         ephemeral_seed = os.urandom(32)
 
     ephemeral_pub = _ed25519_pub_from_seed(ephemeral_seed)
     shared = _x25519_shared_secret(ephemeral_seed, viewing_pub_key)
-
-    view_tag = _compute_view_tag(shared)
     h_scalar = _hash_to_scalar(shared)
 
-    stealth_pub = _ed25519_point_add(spending_pub_key, h_scalar)
-    stealth_address = _pub_key_to_stellar_address(stealth_pub)
+    stealth_pub = _derive_stealth_pub_key(spending_pub_key, h_scalar)
 
     return GeneratedStealthAddress(
-        stealth_address=stealth_address,
+        stealth_address=_pub_key_to_stellar_address(stealth_pub),
         ephemeral_pub_key=ephemeral_pub,
-        view_tag=view_tag,
+        view_tag=compute_view_tag(ephemeral_pub, viewing_pub_key),
     )
 
 
@@ -386,6 +403,7 @@ def scan_announcements(
     Scan a list of announcement dicts for payments addressed to these keys.
 
     Each announcement dict must have:
+      scheme_id         : int (2 for the v2 announcer)
       ephemeral_pub_key : hex string (64 chars, 32 bytes)
       metadata          : hex string (first byte = view tag)
       stealth_address   : str (G... address)
@@ -393,29 +411,36 @@ def scan_announcements(
     Returns only announcements that match — with the derived private scalar
     needed to spend the funds.
 
-    View-tag prefilter: only ~1/256 non-matching announcements reach the
-    expensive X25519 step (false-positive rate ≈ 0.39 %).
+    View-tag prefilter: the tag costs one SHA-256, so only ~1/256 of the
+    non-matching announcements reach the X25519 step (false-positive rate ≈ 0.39 %).
     """
+    viewing_pub_key = _ed25519_pub_from_seed(viewing_key)
     results: list[MatchedAnnouncement] = []
 
     for ann in announcements:
-        eph_bytes = bytes.fromhex(ann["ephemeral_pub_key"])
-        meta_bytes = bytes.fromhex(ann["metadata"])
-        announced_view_tag = meta_bytes[0]
+        if ann.get("scheme_id") != SCHEME_ID:
+            continue
+        try:
+            eph_bytes = bytes.fromhex(ann["ephemeral_pub_key"])
+            announced_view_tag = bytes.fromhex(ann["metadata"])[0]
+        except (KeyError, ValueError, IndexError):
+            continue  # malformed announcement
 
         # ------------------------------------------------------------------
-        # Cheap prefilter: compute expected view tag and compare
+        # Cheap prefilter: compare the view tag before any curve operation
         # ------------------------------------------------------------------
-        shared = _x25519_shared_secret(viewing_key, eph_bytes)
-        expected_tag = _compute_view_tag(shared)
-        if expected_tag != announced_view_tag:
+        if compute_view_tag(eph_bytes, viewing_pub_key) != announced_view_tag:
             continue  # skip ~255/256 of non-matching entries
 
         # ------------------------------------------------------------------
         # Full check: derive the expected stealth address and compare
         # ------------------------------------------------------------------
+        try:
+            shared = _x25519_shared_secret(viewing_key, eph_bytes)
+        except ValueError:
+            continue  # the ephemeral key is not a valid ed25519 point
         h_scalar = _hash_to_scalar(shared)
-        stealth_pub = _ed25519_point_add(spending_pub_key, h_scalar)
+        stealth_pub = _derive_stealth_pub_key(spending_pub_key, h_scalar)
         derived_address = _pub_key_to_stellar_address(stealth_pub)
 
         if derived_address != ann["stealth_address"]:
@@ -426,6 +451,8 @@ def scan_announcements(
         # stealth_scalar = (spending_scalar + h_scalar) mod L
         # ------------------------------------------------------------------
         stealth_scalar = (spending_scalar + h_scalar) % L
+        if stealth_scalar == 0:
+            continue
 
         results.append(MatchedAnnouncement(
             stealth_address=derived_address,
@@ -438,8 +465,8 @@ def scan_announcements(
 ```
 
 <Accordion title="Why a utility file instead of a pip package?">
-  The crypto needed for Wraith's Stellar scheme is deliberately small — roughly
-  200 lines of hashing and curve arithmetic. Shipping it inline keeps this
+  The crypto needed for Wraith's Stellar scheme is deliberately small — a few
+  hundred lines of hashing and curve arithmetic. Shipping it inline keeps this
   quickstart dependency-free beyond `stellar-sdk` and `cryptography`, both of
   which are already in most Python fintech backends. A standalone
   `wraith-stellar-py` package is on the roadmap.
@@ -449,7 +476,7 @@ def scan_announcements(
 
 ## Step 3 — Derive your stealth keys
 
-```python no-check
+```python
 import os
 from stellar_sdk import Keypair
 from wraith_crypto import STEALTH_SIGNING_MESSAGE, derive_stealth_keys, encode_meta_address
@@ -462,10 +489,11 @@ keypair = Keypair.from_secret(os.environ["STELLAR_SECRET"])
 signature = keypair.sign(STEALTH_SIGNING_MESSAGE.encode())
 
 keys = derive_stealth_keys(signature)
+meta_address = encode_meta_address(keys.spending_pub_key, keys.viewing_pub_key)
 
 print("Spending pub key:", keys.spending_pub_key.hex())
 print("Viewing  pub key:", keys.viewing_pub_key.hex())
-print("Meta-address:    ", encode_meta_address(keys.spending_pub_key, keys.viewing_pub_key))
+print("Meta-address:    ", meta_address)
 # → st:xlm:<64 hex chars><64 hex chars>
 ```
 
@@ -477,15 +505,18 @@ one in the TypeScript SDK, so keys derived here are usable by any SDK implementa
 
 ## Step 4 — Fetch announcements from the Soroban RPC
 
-The Soroban RPC's `getEvents` method returns paginated contract events. The utility
-below fetches all `WRAITH_ANNOUNCEMENT` events from the announcer contract and
+The Soroban RPC's `getEvents` method returns contract events one page at a time.
+The utility below pages through recent events from the announcer contract and
 normalises them into the dict shape `scan_announcements` expects.
 
-```python no-check
-import httpx  # pip install httpx
+```python
+import httpx
+from stellar_sdk import scval, xdr as stellar_xdr
 
-SOROBAN_RPC_URL      = "https://rpc-futurenet.stellar.org"
-ANNOUNCER_CONTRACT_ID = "CCJLJ2QRBJAAKIG6ELNQVXLLWMKKWVN5O2FKWUETHZGMPAD4MHK7WVWL"  # testnet value; futurenet has no live contracts
+from wraith_crypto import SCHEME_ID
+
+SOROBAN_RPC_URL       = "https://soroban-testnet.stellar.org"
+ANNOUNCER_CONTRACT_ID = "CCJLJ2QRBJAAKIG6ELNQVXLLWMKKWVN5O2FKWUETHZGMPAD4MHK7WVWL"  # stealth-announcer v2, testnet
 
 
 def _rpc(method: str, params: dict) -> dict:
@@ -502,125 +533,87 @@ def _rpc(method: str, params: dict) -> dict:
     return body["result"]
 
 
-def _current_ledger_range() -> tuple[int, int]:
-    """Return (oldest_ledger, latest_ledger) from getLatestLedger."""
-    info = _rpc("getLatestLedger", {})
-    latest = info["sequence"]
-    # Soroban RPC retains ~17,280 ledgers (~24 h at 5 s/ledger)
-    oldest = max(latest - 17_000, info.get("oldestLedgerSequence", 0))
-    return oldest, latest
+def _decode(scval_xdr: str):
+    """Decode a base64 XDR ScVal into plain Python values."""
+    return scval.to_native(stellar_xdr.SCVal.from_xdr(scval_xdr))
 
 
-def fetch_announcements() -> list[dict]:
+def fetch_announcements(lookback_ledgers: int = 17_000) -> list[dict]:
     """
-    Fetch all WRAITH_ANNOUNCEMENT events from the announcer contract.
+    Fetch recent announcements from the stealth-announcer contract.
 
-    Returns a list of announcement dicts with keys:
-      stealth_address, caller, ephemeral_pub_key, metadata, scheme_id
+    The v2 announcer publishes each announcement as
+      topics = ("announce", scheme_id, view_tag_bucket, metadata_kind)
+      value  = (stealth_address, ephemeral_pub_key, metadata)
+
+    Returns a list of dicts with keys:
+      scheme_id, stealth_address, ephemeral_pub_key, metadata
     """
-    oldest, latest = _current_ledger_range()
-
-    result = _rpc("getEvents", {
-        "startLedger": oldest,
-        "filters": [{
-            "type": "contract",
-            "contractIds": [ANNOUNCER_CONTRACT_ID],
-            "topics": [["*", "*"]],  # accept all topics from this contract
-        }],
+    latest = _rpc("getLatestLedger", {})["sequence"]
+    filters = [{"type": "contract", "contractIds": [ANNOUNCER_CONTRACT_ID]}]
+    # The RPC keeps a limited event history (~17,280 ledgers is ~24 h at 5 s/ledger)
+    params = {
+        "startLedger": max(latest - lookback_ledgers, 1),
+        "filters": filters,
         "pagination": {"limit": 200},
-    })
+    }
 
     announcements = []
-    for event in result.get("events", []):
-        # Each Soroban event has a `topic` array and a `value` (XDR ScVal)
-        # The announcer contract emits:
-        #   topic[0] = Symbol("WRAITH_ANNOUNCEMENT")
-        #   topic[1] = scheme_id (u32)
-        # value = Map { stealth_address, caller, ephemeral_pub_key, metadata }
-        topics = event.get("topic", [])
-        if not topics:
-            continue
+    while True:
+        page = _rpc("getEvents", params)
+        events = page.get("events", [])
+        if not events:
+            break
 
-        # Decode the XDR value using stellar-sdk
-        from stellar_sdk import xdr as stellar_xdr
-        import base64
+        for event in events:
+            topics = [_decode(topic) for topic in event["topic"]]
+            if len(topics) != 4 or topics[0] != "announce" or topics[1] != SCHEME_ID:
+                continue  # not a v2 announcement
+            stealth_address, ephemeral_pub_key, metadata = _decode(event["value"])
+            announcements.append({
+                "scheme_id": topics[1],
+                "stealth_address": stealth_address.address,  # G... address
+                "ephemeral_pub_key": ephemeral_pub_key.hex(),
+                "metadata": metadata.hex(),
+            })
 
-        raw_xdr = event.get("value", {}).get("xdr", "")
-        if not raw_xdr:
-            continue
-
-        try:
-            sc_val = stellar_xdr.SCVal.from_xdr(raw_xdr)
-        except Exception:
-            continue  # malformed event — skip
-
-        # Parse the map entries
-        ann: dict = {}
-        if sc_val.type == stellar_xdr.SCValType.SCV_MAP and sc_val.map:
-            for entry in sc_val.map.sc_map:
-                key_sym = entry.key.sym.sc_symbol.decode() if entry.key.sym else None
-                if key_sym == "stealth_address":
-                    ann["stealth_address"] = entry.val.address.account_id  # G... address
-                elif key_sym == "caller":
-                    ann["caller"] = entry.val.address.account_id
-                elif key_sym == "ephemeral_pub_key":
-                    ann["ephemeral_pub_key"] = entry.val.bytes.sc_bytes.hex()
-                elif key_sym == "metadata":
-                    ann["metadata"] = entry.val.bytes.sc_bytes.hex()
-
-        if {"stealth_address", "ephemeral_pub_key", "metadata"} <= ann.keys():
-            announcements.append(ann)
+        # The cursor continues after the last event; it replaces startLedger
+        params = {"filters": filters, "pagination": {"cursor": page["cursor"], "limit": 200}}
 
     return announcements
 ```
 
-<Note>
-  Futurenet resets on demand and carries no live Wraith contracts — use the
-  testnet `ANNOUNCER_CONTRACT_ID` when testing against testnet.
-  On futurenet you can still exercise the full code path by injecting synthetic
-  announcements (see Step 6 below).
-</Note>
-
 <Tip>
-  For high-throughput backends, consider caching the announcement list and
-  polling only for events newer than the last seen ledger sequence, incrementing
-  `startLedger` on each poll instead of re-fetching from `oldest`.
+  For high-throughput backends, cache the announcement list and keep the last
+  cursor. Each poll then asks only for events after it instead of re-fetching the
+  whole window.
 </Tip>
 
 ---
 
 ## Step 5 — Scan for owned announcements
 
-```python no-check
-import os
-from stellar_sdk import Keypair
-from wraith_crypto import (
-    STEALTH_SIGNING_MESSAGE,
-    derive_stealth_keys,
-    scan_announcements,
-)
-
-keypair = Keypair.from_secret(os.environ["STELLAR_SECRET"])
-keys = derive_stealth_keys(keypair.sign(STEALTH_SIGNING_MESSAGE.encode()))
+```python
+from wraith_crypto import scan_announcements
 
 announcements = fetch_announcements()  # from Step 4
 
 matches = scan_announcements(
     announcements,
-    viewing_key=keys.viewing_key,
+    viewing_key=keys.viewing_key,  # `keys` from Step 3
     spending_pub_key=keys.spending_pub_key,
     spending_scalar=keys.spending_scalar,
 )
 
 for m in matches:
     print(f"Found payment at: {m.stealth_address}")
-    print(f"  Private scalar:  {hex(m.stealth_private_scalar)}")
-    # m.stealth_private_scalar lets you sign transactions from this stealth address
+    # m.stealth_private_scalar signs for this address (Step 7).
+    # Treat it like a secret key: never log or share it.
 ```
 
-The scanner applies the view-tag prefilter first, so the expensive X25519 operation
-runs only for ~1 in 256 non-matching announcements. On a list of 10,000
-announcements you would expect ~39 false-positive ECDH calls before the full
+The scanner checks the view tag first. It costs one SHA-256, so the expensive
+X25519 operation runs only for ~1 in 256 non-matching announcements. On a list of
+10,000 announcements you would expect ~39 false-positive ECDH calls before the full
 address check eliminates them.
 
 ---
@@ -633,12 +626,13 @@ announcer contract.
 
 ### 6a — Resolve the recipient's meta-address
 
-```python no-check
+```python
 from wraith_crypto import decode_meta_address, generate_stealth_address
 
-# The recipient shares their meta-address — either directly or via a .wraith name.
-# For this quickstart we use a literal; in production resolve it from the names contract.
-RECIPIENT_META_ADDRESS = "st:xlm:<spending_hex><viewing_hex>"
+# In production the recipient shares their meta-address, directly or through a
+# .wraith name. Here you pay your own meta-address from Step 3, so Steps 4 and 5
+# find the payment once the announcement lands.
+RECIPIENT_META_ADDRESS = meta_address
 
 spending_pub, viewing_pub = decode_meta_address(RECIPIENT_META_ADDRESS)
 stealth = generate_stealth_address(spending_pub, viewing_pub)
@@ -654,25 +648,21 @@ New Stellar accounts must be activated with `createAccount`. After activation, c
 the Soroban announcer contract to publish the ephemeral key and view tag so the
 recipient can detect their payment.
 
-```python no-check
+```python
 import os
-import base64
-from stellar_sdk import (
-    Keypair, Network, Server, TransactionBuilder, Asset,
-    Operation,
-)
-from stellar_sdk.soroban_rpc import SorobanServer
-from stellar_sdk import xdr as stellar_xdr
+from stellar_sdk import Keypair, Network, Server, SorobanServer, TransactionBuilder, scval
+from stellar_sdk.soroban_rpc import SendTransactionStatus
 
-HORIZON_URL   = "https://horizon-testnet.stellar.org"
-SOROBAN_URL   = "https://soroban-testnet.stellar.org"
-NETWORK_PASS  = Network.TESTNET_NETWORK_PASSPHRASE
-AMOUNT_XLM    = "10"  # minimum to activate the new stealth account
+from wraith_crypto import SCHEME_ID
+
+HORIZON_URL  = "https://horizon-testnet.stellar.org"
+NETWORK_PASS = Network.TESTNET_NETWORK_PASSPHRASE
+AMOUNT_XLM   = "10"  # starting balance for the stealth account (the minimum is 1 XLM)
 
 sender_keypair = Keypair.from_secret(os.environ["STELLAR_SECRET"])
 
-horizon  = Server(HORIZON_URL)
-soroban  = SorobanServer(SOROBAN_URL)
+horizon = Server(HORIZON_URL)
+soroban = SorobanServer(SOROBAN_RPC_URL)  # from Step 4
 
 # ------------------------------------------------------------------
 # Part 1: createAccount — activate the stealth address
@@ -699,19 +689,14 @@ print("Stealth account activated:", stealth.stealth_address)
 # ------------------------------------------------------------------
 # Part 2: invoke stealth-announcer::announce
 # ------------------------------------------------------------------
-# Build the announcement metadata: first byte = view_tag
-metadata_bytes = bytes([stealth.view_tag])
-
-# Construct the Soroban invocation arguments
 # announce(scheme_id: u32, stealth_address: Address,
-#          ephemeral_pub_key: Bytes, metadata: Bytes)
-from stellar_sdk import scval
-
+#          ephemeral_pub_key: BytesN<32>, metadata: Bytes)
+# The first metadata byte is the view tag.
 invoke_args = [
-    scval.to_uint32(1),                                       # scheme_id
-    scval.to_address(stealth.stealth_address),                # stealth address
-    scval.to_bytes(stealth.ephemeral_pub_key),                # ephemeral pub key
-    scval.to_bytes(metadata_bytes),                           # metadata (view tag)
+    scval.to_uint32(SCHEME_ID),                   # scheme_id (2)
+    scval.to_address(stealth.stealth_address),    # stealth address
+    scval.to_bytes(stealth.ephemeral_pub_key),    # ephemeral pub key
+    scval.to_bytes(bytes([stealth.view_tag])),    # metadata (view tag)
 ]
 
 sender_account = horizon.load_account(sender_keypair.public_key)  # refresh sequence
@@ -731,19 +716,22 @@ announce_tx = (
     .build()
 )
 
-# Simulate to get resource footprint before signing
-sim = soroban.simulate_transaction(announce_tx)
-announce_tx = sim.transaction  # updated with resource fee
+# Simulate, then attach the resource footprint and fee before signing
+announce_tx = soroban.prepare_transaction(announce_tx)
 announce_tx.sign(sender_keypair)
 
-response = soroban.send_transaction(announce_tx)
-print("Announcement tx hash:", response.hash)
+sent = soroban.send_transaction(announce_tx)
+if sent.status != SendTransactionStatus.PENDING:
+    raise RuntimeError(f"Announcement rejected: {sent.status}")
+result = soroban.poll_transaction(sent.hash)  # waits for the ledger to close
+print("Announcement tx:", sent.hash, result.status.value)
 ```
 
 <Warning>
-  On futurenet the Wraith contracts are not deployed, so the announcer call will
-  fail. Run Step 6 against **testnet** using the testnet `ANNOUNCER_CONTRACT_ID`
-  and the testnet Horizon/Soroban URLs from [Stellar Networks](/reference/stellar-networks).
+  Fund the sender on testnet with Friendbot before running Step 6. On mainnet,
+  swap in the mainnet Horizon and RPC URLs, `Network.PUBLIC_NETWORK_PASSPHRASE`,
+  and the mainnet `ANNOUNCER_CONTRACT_ID` from
+  [Stellar Networks](/reference/stellar-networks).
 </Warning>
 
 ---
@@ -752,84 +740,75 @@ print("Announcement tx hash:", response.hash)
 
 To spend funds held at a stealth address you need the private scalar derived
 during scanning. Because stealth scalars are not raw seeds, the standard
-`Keypair.from_raw_ed25519_seed()` path does not work. Use `signWithScalar` from
-`wraith_crypto` below.
+`Keypair.from_raw_ed25519_seed()` path does not work. Add `sign_with_scalar` to
+`wraith_crypto.py`:
 
-```python no-check
+```python
 # Add to wraith_crypto.py
 
-def sign_with_scalar(
-    message: bytes,
-    scalar: int,
-    pub_key_bytes: bytes,
-) -> bytes:
+def sign_with_scalar(message: bytes, scalar: int, pub_key_bytes: bytes) -> bytes:
     """
     Sign `message` using a raw ed25519 scalar (not a seed).
 
     Required because stealth scalars are (spending_scalar + h_scalar) mod L,
     which is not necessarily clamped and cannot be fed to standard seed-based
-    signing APIs.
+    signing APIs. Mirrors signWithScalar in SDK scalar.ts, byte for byte.
 
     Compatible with RFC 8032 ed25519 — the signature will verify against
     `pub_key_bytes` using any standard ed25519 verifier.
     """
-    import struct
-
-    # Encode scalar as little-endian 32 bytes
+    if not 0 < scalar < L:
+        raise ValueError("Scalar must be in range (0, L)")
     s_bytes = scalar.to_bytes(32, "little")
 
-    # Deterministic nonce: SHA-512(scalar_bytes || message), lower half, clamped
-    nonce_hash = _sha512(s_bytes + message)
-    r_bytes = bytearray(nonce_hash[:32])
-    _clamp_scalar(r_bytes)
-    r = int.from_bytes(r_bytes, "little")
+    # Deterministic nonce: r = SHA-512(SHA-256(scalar_bytes) || message) mod L
+    r = int.from_bytes(_sha512(_sha256(s_bytes), message), "little") % L
 
     # R = r * G
-    r_key = Ed25519PrivateKey.from_private_bytes(bytes(r_bytes))
-    R_bytes = r_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    R_bytes = _scalar_mult_base(r)
 
     # S = (r + SHA-512(R || pub_key || message) * s) mod L
-    k_hash = _sha512(R_bytes + pub_key_bytes + message)
-    k = int.from_bytes(k_hash, "little") % L
+    k = int.from_bytes(_sha512(R_bytes, pub_key_bytes, message), "little") % L
     S = (r + k * scalar) % L
 
     return R_bytes + S.to_bytes(32, "little")
 ```
 
-Use it when building a withdrawal transaction from a matched stealth address:
+Use it to withdraw from a matched stealth address. The example merges the
+stealth account into your primary account, which sends its whole balance (base
+reserve included) and closes the one-time account:
 
-```python no-check
+```python
+from stellar_sdk import DecoratedSignature
+
 from wraith_crypto import sign_with_scalar
 
-# `match` is a MatchedAnnouncement from scan_announcements()
+if not matches:
+    raise SystemExit("No payments yet. Re-run Steps 4 and 5 after the Step 6 announcement lands.")
+
+match = matches[0]  # a MatchedAnnouncement from Step 5
 stealth_keypair = Keypair.from_raw_ed25519_public_key(match.stealth_pub_key_bytes)
 stealth_account = horizon.load_account(stealth_keypair.public_key)
 
-# Build a payment back to your primary account
 withdrawal_tx = (
     TransactionBuilder(
         source_account=stealth_account,
         network_passphrase=NETWORK_PASS,
         base_fee=1000,
     )
-    .append_payment_op(
-        destination=sender_keypair.public_key,
-        asset=Asset.native(),
-        amount="9",   # leave ~1 XLM for fees / base reserve
-    )
+    .append_account_merge_op(destination=sender_keypair.public_key)
     .set_timeout(30)
     .build()
 )
 
-# Sign with raw scalar — not with a Keypair seed
-tx_hash = withdrawal_tx.hash()
-sig_bytes = sign_with_scalar(tx_hash, match.stealth_private_scalar, match.stealth_pub_key_bytes)
-
-withdrawal_tx.transaction.add_signature(
-    network_id=Network.TESTNET_NETWORK_PASSPHRASE,
-    public_key=stealth_keypair.public_key,
-    signature=sig_bytes,
+# Sign with the raw scalar — not with a Keypair seed
+sig_bytes = sign_with_scalar(
+    withdrawal_tx.hash(), match.stealth_private_scalar, match.stealth_pub_key_bytes
 )
+withdrawal_tx.signatures.append(
+    DecoratedSignature(stealth_keypair.signature_hint(), sig_bytes)
+)
+
 response = horizon.submit_transaction(withdrawal_tx)
 print("Withdrawal tx hash:", response["hash"])
 ```
@@ -861,7 +840,7 @@ concerns — it handles only the cryptographic layer so it stays testable in iso
 
 ## Environment variables
 
-```bash no-check
+```bash
 # .env — never commit this file
 STELLAR_SECRET=S...your-secret-key
 
