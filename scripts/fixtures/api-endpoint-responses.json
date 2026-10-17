@@ -1,0 +1,131 @@
+{
+  "$comment": "Network responses served to the api-reference/endpoints.mdx examples by scripts/check-api-examples.ts. Each entry is consumed once, in order, by the request it names. `type` is a response type declared on that page; the checker compiles every body with `satisfies <type>`, so a fixture that drifts from the documented shape fails the check.",
+  "responses": [
+    {
+      "request": "POST /agent/create",
+      "status": 201,
+      "type": "AgentInfo",
+      "body": {
+        "id": "6f1c2a9e-4b7d-4e2a-9c3f-1d8b5e7a2c40",
+        "name": "alice",
+        "chain": "stellar",
+        "address": "GB4X7TDIRWAXKYRAYRXSTY27DZUTQKEMJKV7GBKZ3RVJJS5XCHAELUZI",
+        "metaAddress": "st:xlm:eb8452e938d04e9a56ef69c47dacd8224464b030b5ca569d5b4e4399f8d0fb5529a8dd877a3803289ab3a62ac39cce4a99021a3cd0fac6ad982e051c8fa769dc"
+      }
+    },
+    {
+      "request": "POST /agent/6f1c2a9e-4b7d-4e2a-9c3f-1d8b5e7a2c40/chat",
+      "status": 201,
+      "type": "ChatResponse",
+      "body": {
+        "response": "Your balance is 10,000 XLM.",
+        "conversationId": "0d9e4c1b-7a52-4f0e-8b3d-2c6a9f1e5b77"
+      }
+    },
+    {
+      "request": "POST /agent/6f1c2a9e-4b7d-4e2a-9c3f-1d8b5e7a2c40/chat",
+      "status": 201,
+      "type": "ChatResponse",
+      "body": {
+        "response": "No new stealth payments since your last scan.",
+        "toolCalls": [
+          {
+            "name": "scan_payments",
+            "status": "success",
+            "detail": "[]"
+          }
+        ],
+        "conversationId": "0d9e4c1b-7a52-4f0e-8b3d-2c6a9f1e5b77"
+      }
+    },
+    {
+      "request": "GET /agent/6f1c2a9e-4b7d-4e2a-9c3f-1d8b5e7a2c40/conversations",
+      "status": 200,
+      "type": "Conversation[]",
+      "body": [
+        {
+          "id": "0d9e4c1b-7a52-4f0e-8b3d-2c6a9f1e5b77",
+          "title": "What is my balance?",
+          "createdAt": "2026-10-17T09:00:00.000Z",
+          "updatedAt": "2026-10-17T09:01:30.000Z"
+        },
+        {
+          "id": "a3f7b2d8-5c1e-4d9a-b6f0-8e2c4a7d1b93",
+          "title": "Pay bob.wraith 25 XLM",
+          "createdAt": "2026-10-16T14:20:00.000Z",
+          "updatedAt": "2026-10-16T14:21:05.000Z"
+        }
+      ]
+    },
+    {
+      "request": "GET /agent/6f1c2a9e-4b7d-4e2a-9c3f-1d8b5e7a2c40/conversations/0d9e4c1b-7a52-4f0e-8b3d-2c6a9f1e5b77/messages",
+      "status": 200,
+      "type": "Message[]",
+      "body": [
+        {
+          "role": "user",
+          "text": "What is my balance?",
+          "createdAt": "2026-10-17T09:00:00.000Z"
+        },
+        {
+          "role": "agent",
+          "text": "Your balance is 10,000 XLM.",
+          "createdAt": "2026-10-17T09:00:02.000Z"
+        },
+        {
+          "role": "user",
+          "text": "Scan for incoming stealth payments",
+          "createdAt": "2026-10-17T09:01:20.000Z"
+        },
+        {
+          "role": "tool",
+          "text": "scan_payments\n[]",
+          "createdAt": "2026-10-17T09:01:29.000Z"
+        },
+        {
+          "role": "agent",
+          "text": "No new stealth payments since your last scan.",
+          "createdAt": "2026-10-17T09:01:30.000Z"
+        }
+      ]
+    },
+    {
+      "request": "GET /agent/6f1c2a9e-4b7d-4e2a-9c3f-1d8b5e7a2c40/conversations/a3f7b2d8-5c1e-4d9a-b6f0-8e2c4a7d1b93/messages",
+      "status": 200,
+      "type": "Message[]",
+      "body": [
+        {
+          "role": "user",
+          "text": "Pay bob.wraith 25 XLM",
+          "createdAt": "2026-10-16T14:20:00.000Z"
+        },
+        {
+          "role": "agent",
+          "text": "Sent 25 XLM to bob.wraith through a fresh stealth address.",
+          "createdAt": "2026-10-16T14:21:05.000Z"
+        }
+      ]
+    },
+    {
+      "request": "GET /agent/info/alice",
+      "status": 200,
+      "type": "AgentInfo",
+      "body": {
+        "id": "6f1c2a9e-4b7d-4e2a-9c3f-1d8b5e7a2c40",
+        "name": "alice",
+        "chain": "stellar",
+        "address": "GB4X7TDIRWAXKYRAYRXSTY27DZUTQKEMJKV7GBKZ3RVJJS5XCHAELUZI",
+        "metaAddress": "st:xlm:eb8452e938d04e9a56ef69c47dacd8224464b030b5ca569d5b4e4399f8d0fb5529a8dd877a3803289ab3a62ac39cce4a99021a3cd0fac6ad982e051c8fa769dc"
+      }
+    },
+    {
+      "request": "GET /agent/info/bob",
+      "status": 404,
+      "type": "ApiError",
+      "body": {
+        "message": "Agent not found",
+        "statusCode": 404
+      }
+    }
+  ]
+}

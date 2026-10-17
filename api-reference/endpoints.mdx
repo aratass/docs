@@ -5,6 +5,8 @@ description: "Full HTTP API reference for the managed platform"
 
 The TEE server exposes a REST API. The SDK's `Wraith` and `WraithAgent` classes wrap these endpoints — most developers don't call them directly.
 
+The TypeScript examples on this page build on each other. Run them in order, starting with the client in the Authentication section.
+
 ## Authentication
 
 All requests require an API key:
@@ -18,6 +20,68 @@ Optional BYOM headers:
 ```
 X-AI-Provider: openai
 X-AI-Key: sk-...
+```
+
+### Example Client
+
+The examples share one `fetch` wrapper. It sends the API key as a bearer token, adds the BYOM headers when you pass a model key, and turns error responses into a `WraithApiError`:
+
+```typescript
+const WRAITH_API_URL = "https://api.wraith.dev";
+
+type HttpMethod = "GET" | "POST" | "DELETE";
+
+interface WraithClientOptions {
+  apiKey: string;
+  baseUrl?: string;
+  // Optional BYOM: run agent chat on your own model provider key.
+  ai?: { provider: "gemini" | "openai" | "claude"; apiKey: string };
+}
+
+class WraithApiError extends Error {
+  readonly statusCode: number;
+
+  constructor(statusCode: number, message: string) {
+    super(message);
+    this.name = "WraithApiError";
+    this.statusCode = statusCode;
+  }
+}
+
+function createWraithClient(options: WraithClientOptions) {
+  const baseUrl = (options.baseUrl ?? WRAITH_API_URL).replace(/\/+$/, "");
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${options.apiKey}`,
+    "Content-Type": "application/json",
+  };
+  if (options.ai) {
+    headers["X-AI-Provider"] = options.ai.provider;
+    headers["X-AI-Key"] = options.ai.apiKey;
+  }
+
+  return async function request<T>(method: HttpMethod, path: string, body?: unknown): Promise<T> {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      // Error bodies use the ApiError shape from Error Responses below.
+      const error = (await res.json().catch(() => null)) as Partial<ApiError> | null;
+      throw new WraithApiError(res.status, error?.message ?? res.statusText);
+    }
+
+    return (await res.json()) as T;
+  };
+}
+
+const apiKey = process.env.WRAITH_API_KEY;
+if (!apiKey) {
+  throw new Error("Set WRAITH_API_KEY to your Wraith API key");
+}
+
+const wraith = createWraithClient({ apiKey });
 ```
 
 ---
@@ -34,8 +98,8 @@ Create a new agent with a `.wraith` name.
 
 **Request:**
 
-```typescript no-check
-{
+```typescript
+interface CreateAgentRequest {
   name: string;          // "alice" (becomes alice.wraith)
   chain: string;         // "horizen" | "stellar" | "ethereum" | ...
   wallet: string;        // owner wallet address
@@ -44,16 +108,38 @@ Create a new agent with a `.wraith` name.
 }
 ```
 
-**Response:**
+**Response:** `AgentInfo`
 
 ```typescript
-{
+interface AgentInfo {
   id: string;            // UUID
   name: string;          // "alice"
   chain: string;         // "horizen"
   address: string;       // agent's on-chain address
   metaAddress: string;   // stealth meta-address
 }
+```
+
+**Example:**
+
+```typescript
+import { Keypair } from "@stellar/stellar-sdk";
+import { Chain } from "@wraith-protocol/sdk";
+
+// The owner wallet signs a message to prove it owns the new agent.
+// Keypair.random() keeps the example self-contained. Sign with the real owner wallet.
+const owner = Keypair.random();
+const ownershipMessage = "Sign to create Wraith agent";
+
+const agent = await wraith<AgentInfo>("POST", "/agent/create", {
+  name: "alice",
+  chain: Chain.Stellar,
+  wallet: owner.publicKey(),
+  signature: owner.sign(Buffer.from(ownershipMessage)).toString("hex"),
+  message: ownershipMessage,
+} satisfies CreateAgentRequest);
+
+console.log(`${agent.name}.wraith on ${agent.chain}: ${agent.metaAddress}`);
 ```
 
 ### List Agents
@@ -105,7 +191,7 @@ Returns balance, pending invoices, and other stats.
 **Response:**
 
 ```typescript
-{
+interface AgentStatus {
   balance: string;
   tokens: Record<string, string>;
   pendingInvoices: number;
@@ -126,7 +212,7 @@ Export the agent's private key. Requires a fresh wallet signature.
 **Request:**
 
 ```typescript
-{
+interface ExportKeyRequest {
   signature: string;     // fresh signature from owner wallet
   message: string;       // signed message
 }
@@ -135,7 +221,7 @@ Export the agent's private key. Requires a fresh wallet signature.
 **Response:**
 
 ```typescript
-{
+interface ExportKeyResponse {
   secret: string;        // "0x..." — the agent's private key
 }
 ```
@@ -154,8 +240,8 @@ Send a natural language message to the AI agent.
 
 **Request:**
 
-```typescript no-check
-{
+```typescript
+interface ChatRequest {
   message: string;
   conversationId?: string;  // continue existing conversation
 }
@@ -163,8 +249,8 @@ Send a natural language message to the AI agent.
 
 **Response:**
 
-```typescript no-check
-{
+```typescript
+interface ChatResponse {
   response: string;          // agent's text reply
   toolCalls?: ToolCall[];    // tools the agent executed
   conversationId: string;    // conversation ID for continuity
@@ -176,6 +262,24 @@ interface ToolCall {
   name: string;              // "send_payment", "scan_payments", etc.
   status: string;            // "success" or "error"
   detail?: string;           // JSON string with tool result
+}
+```
+
+**Example:**
+
+```typescript
+const reply = await wraith<ChatResponse>("POST", `/agent/${agent.id}/chat`, {
+  message: "What is my balance?",
+} satisfies ChatRequest);
+
+// Pass conversationId to keep the next message in the same conversation.
+const followUp = await wraith<ChatResponse>("POST", `/agent/${agent.id}/chat`, {
+  message: "Scan for incoming stealth payments",
+  conversationId: reply.conversationId,
+} satisfies ChatRequest);
+
+for (const call of followUp.toolCalls ?? []) {
+  console.log(`${call.name}: ${call.status}`);
 }
 ```
 
@@ -214,14 +318,14 @@ POST /agent/:id/conversations
 GET /agent/:id/conversations/:convId/messages
 ```
 
-**Response:**
+**Response:** `Message[]`
 
 ```typescript
-Array<{
+interface Message {
   role: "user" | "agent" | "tool" | "system";
   text: string;
   createdAt: string;
-}>
+}
 ```
 
 ### Delete Conversation
@@ -243,7 +347,7 @@ GET /invoice/:id
 **Response:**
 
 ```typescript
-{
+interface Invoice {
   id: string;
   agentName: string;
   amount: string;
@@ -276,8 +380,8 @@ GET /agent/:id/notifications
 
 **Response:**
 
-```typescript no-check
-{
+```typescript
+interface NotificationList {
   notifications: Notification[];
   unreadCount: number;
 }
@@ -319,7 +423,7 @@ GET /health
 **Response:**
 
 ```typescript
-{
+interface HealthResponse {
   status: "ok";
 }
 ```
@@ -342,12 +446,36 @@ Returns cryptographic proof that the TEE is running authentic code and the agent
 
 ---
 
+## Pagination
+
+List endpoints such as `GET /agents`, `GET /agent/:id/conversations`, and `GET /agent/:id/notifications` return the whole collection in one response. They take no page or cursor parameters, so page through results on the client. This example loads messages only for the conversations on the first page:
+
+```typescript
+const PAGE_SIZE = 20;
+
+function getPage<T>(items: readonly T[], pageIndex: number, pageSize = PAGE_SIZE): T[] {
+  return items.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize);
+}
+
+const conversations = await wraith<Conversation[]>("GET", `/agent/${agent.id}/conversations`);
+
+for (const conversation of getPage(conversations, 0)) {
+  const messages = await wraith<Message[]>(
+    "GET",
+    `/agent/${agent.id}/conversations/${conversation.id}/messages`,
+  );
+  console.log(`${conversation.title}: ${messages.length} messages`);
+}
+```
+
+---
+
 ## Error Responses
 
 All errors return JSON with a `message` field:
 
 ```typescript
-{
+interface ApiError {
   message: string;
   statusCode: number;
 }
@@ -363,22 +491,43 @@ All errors return JSON with a `message` field:
 
 ### Example
 
-```typescript no-check
+```typescript
 // 400 Bad Request
-{
-  "message": "Name must be 3-32 characters, lowercase alphanumeric and hyphens only",
-  "statusCode": 400
-}
+const invalidName: ApiError = {
+  message: "Name must be 3-32 characters, lowercase alphanumeric and hyphens only",
+  statusCode: 400,
+};
 
 // 401 Unauthorized
-{
-  "message": "Invalid API key",
-  "statusCode": 401
-}
+const invalidApiKey: ApiError = {
+  message: "Invalid API key",
+  statusCode: 401,
+};
 
 // 409 Conflict
-{
-  "message": "Name 'alice' is already registered",
-  "statusCode": 409
+const nameTaken: ApiError = {
+  message: "Name 'alice' is already registered",
+  statusCode: 409,
+};
+```
+
+### Handling Errors
+
+`WraithApiError` carries the HTTP status code, so branch on `statusCode`. A 404 from the name lookup means no agent is registered under that name:
+
+```typescript
+async function isNameAvailable(name: string): Promise<boolean> {
+  try {
+    await wraith<AgentInfo>("GET", `/agent/info/${encodeURIComponent(name)}`);
+    return false; // an agent already uses this name
+  } catch (err) {
+    if (err instanceof WraithApiError && err.statusCode === 404) {
+      return true;
+    }
+    throw err; // 401 invalid API key, 500 server error, ...
+  }
 }
+
+console.log("alice available:", await isNameAvailable("alice"));
+console.log("bob available:", await isNameAvailable("bob"));
 ```

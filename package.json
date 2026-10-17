@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "check:placeholders": "tsx scripts/check-placeholders.ts",
-    "check:snippets": "tsx scripts/check-snippets.ts",
+    "check:snippets": "tsx scripts/check-snippets.ts && tsx scripts/check-api-examples.ts",
+    "check:api-examples": "tsx scripts/check-api-examples.ts",
     "check:snippets-extended": "tsx scripts/check-snippets-extended.ts",
     "check:nav-coverage": "node scripts/check-nav-coverage.mjs",
     "check:contract-registry": "node scripts/check-contract-registry.mjs",
